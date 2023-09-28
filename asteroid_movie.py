@@ -11,7 +11,7 @@ parser.add_argument("-t", "--tol",   type=float, default=0.0)
 parser.add_argument("-l", "--lknee", type=float, default=1500)
 parser.add_argument("-a", "--alpha", type=float, default=3.5)
 parser.add_argument("-b", "--beam",  type=float, default=0)
-parser.add_argument("-v", "--verbose", default=1, action="count")
+parser.add_argument("-v", "--verbose", default=3, action="count")
 parser.add_argument("-e", "--quiet",   default=0, action="count")
 parser.add_argument("-i", "--index", type=int, default=-1)
 args = parser.parse_args()
@@ -21,7 +21,12 @@ from pixell import utils, enmap, bunch, reproject, colors, coordinates, mpi
 from scipy import interpolate, optimize
 import glob
 import matplotlib.pyplot as plt
+import matplotlib
+
+matplotlib.use('pdf')
+
 from pathlib import Path
+from asteroid_utils_pixell import minorplanet, get_desig
 
 def in_box(box, point): #checks if points are inside box or not
 	box   = np.asarray(box)
@@ -93,10 +98,7 @@ if args.index == -1:
 	name     = args.name or utils.replace(os.path.basename(args.astinfo), ".npy", "").lower()
 
 else:
-	home = str(Path.home())
-	with open(home+'/dev/minorplanets/asteroids.txt') as f:
-		lines = f.readlines()
-		name = lines[args.index].replace('\n', '')
+	desig, name, semimajor = get_desig(args.index)
 
 lknee    = args.lknee
 alpha    = -args.alpha
@@ -107,6 +109,7 @@ time_tol  = 60
 time_sane = 3600*24
 
 # Expand any globs in the input file names
+print(args.ifiles)
 ifiles  = sum([sorted(utils.glob(ifile)) for ifile in args.ifiles],[]) 
 # Read in and spline the orbit
 
@@ -118,11 +121,23 @@ else:
 orbit   = interpolate.interp1d(info.ctime, [utils.unwind(info.ra*utils.degree), info.dec*utils.degree, info.r, info.ang*utils.arcsec], kind=3)
 utils.mkdir(args.odir)
 
-for fi in range(comm.rank, len(ifiles), comm.size):		
+print('Starting {}'.format(name))
+print('Index {}'.format(args.index))
+
+for fi in range(comm.rank, len(ifiles), comm.size):
 	ifile    = ifiles[fi]
 	infofile = utils.replace(ifile, "map.fits", "info.hdf")
 	tfile    = utils.replace(ifile, "map.fits", "time.fits")
-	ofname   = "%s/%s/%s_%s" % (args.odir, name.capitalize(), name, os.path.basename(ifile))	
+	varfile    = utils.replace(ifile, "map.fits", "ivar.fits")
+	rhofile    = utils.replace(ifile, "map.fits", "rho.fits")
+	kfile    = utils.replace(ifile, "map.fits", "kappa.fits")
+
+	ofname   = "%s/%s/%s_%s" % (args.odir, name.capitalize(), name, os.path.basename(ifile))
+	varname   = "%s/%s/%s_%s" % (args.odir, name.capitalize(), name, os.path.basename(varfile))
+	rhoname   = "%s/%s/%s_%s" % (args.odir, name.capitalize(), name, os.path.basename(rhofile))
+	kname   = "%s/%s/%s_%s" % (args.odir, name.capitalize(), name, os.path.basename(kfile))
+	infoname = "%s/%s/%s_%s" % (args.odir, name.capitalize(), name, os.path.basename(infofile))
+	
 	info     = bunch.read(infofile)
 	# Get the asteroid coordinates
 	ctime0   = np.mean(info.period)
@@ -134,7 +149,10 @@ for fi in range(comm.rank, len(ifiles), comm.size):
 		if verbose >= 3:
 			print(colors.lgray + message + " outside" + colors.reset)
 			continue
-	# Ok, should try to read in this map. Decide on bounding box to read in
+	#Ok, should try to read in this map. Decide on
+	# bounding box to read in
+	
+	
 	full_box  = make_box(ast_pos0, r_full)
 	# Read it and check if we have enough hits in the area we want to use
 	try:
@@ -144,10 +162,10 @@ for fi in range(comm.rank, len(ifiles), comm.size):
 		print("Error reading %s. Skipping" % ifile)
 		continue
 	# Break out early if nothing is hit
-	if np.all(tmap == 0):
-		if verbose >= 2: 
-			print(colors.white + message + " unhit" + colors.reset)
-			continue
+	if np.all(tmap == 0): continue
+		#if verbose >= 2:
+		#	print(colors.white + message + " unhit" + colors.reset)
+ 		#continue
 	# Figure out what time the asteroid was actually observed
 	ctime, err = calc_obs_ctime(orbit, tmap, ctime0)
 	if err > time_tol or abs(ctime-ctime0) > time_sane:
@@ -155,15 +173,22 @@ for fi in range(comm.rank, len(ifiles), comm.size):
 			print(colors.white + message + " time" + colors.reset)
 		continue
 	# Now that we have the proper time, get the asteroids actual position
-	adata     = orbit(ctime)
-	ast_pos   = utils.rewind(adata[1::-1])
+	adata    = orbit(ctime)
+	ast_pos  = utils.rewind(adata[1::-1]).reshape((2,))
+	# optionally transform to topocentric here. ~0.1 arcmin effect
 	thumb_box = make_box(ast_pos, r_thumb)
+
+
 	# Read the actual data
 	try:
 		imap = enmap.read_map(ifile, box=full_box)
-	except (TypeError, FileNotFoundError):
-		print("Error reading %s. Skipping" % ifile)
+		var = enmap.read_map(varfile, box=full_box)
+		rho = enmap.read_map(rhofile, box=full_box)
+		kap = enmap.read_map(kfile, box=full_box)
+	except Exception as e:
+		print(colors.red + str(e) + colors.reset)
 		continue
+
 	if np.mean(imap.submap(thumb_box) == 0) > args.tol:
 		if verbose >= 2:
 			print(colors.white + message + " unhit" + colors.reset)
@@ -173,5 +198,25 @@ for fi in range(comm.rank, len(ifiles), comm.size):
 	# And reproject it
 	omap = reproject.thumbnails(wmap, ast_pos, r=r_thumb)
 	enmap.write_map(ofname, omap)
+
+	vmap = reproject.thumbnails(var, ast_pos, r=r_thumb)
+	enmap.write_map(varname, vmap)
+
+	rmap = reproject.thumbnails(rho, ast_pos, r=r_thumb)
+	enmap.write_map(rhoname, rmap)
+
+	kmap = reproject.thumbnails(kap, ast_pos, r=r_thumb)
+	enmap.write_map(kname, kmap)
+	
+	info.ctime_ast = ctime[0]
+	info.ctime_err = err 
+	bunch.write(infoname, info)
+
 	if verbose >= 1:
 		print(colors.lgreen + message + " ok" + colors.reset)
+print('Finished')
+
+ast = minorplanet(name, semimajor)
+ast.make_all_stacks(weight_type='spt', lightcurve = True, time_debug = True)
+
+
